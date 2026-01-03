@@ -1,16 +1,21 @@
+import time
+import threading
 import azure.cognitiveservices.speech as speechsdk
-import openai
+from openai import OpenAI
 from config import SPEECH_KEY, SPEECH_REGION, OPENAI_API_KEY
 
-# OpenAI key
-openai.api_key = OPENAI_API_KEY
+# -------------------------------
+# OpenAI Client
+# -------------------------------
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Azure Speech Config
+# -------------------------------
+# Azure Speech Configuration
+# -------------------------------
 speech_config = speechsdk.SpeechConfig(
     subscription=SPEECH_KEY,
     region=SPEECH_REGION
 )
-
 speech_config.speech_recognition_language = "en-US"
 speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
 
@@ -25,68 +30,110 @@ speech_synthesizer = speechsdk.SpeechSynthesizer(
     speech_config=speech_config
 )
 
-print("Speak now...")
-print("Listening...")
+# -------------------------------
+# GLOBAL STATE
+# -------------------------------
+ai_speaking = False
+state_lock = threading.Lock()
 
-def is_safe_input(text):
-    text = text.lower()
-    blocked_words = [
-        "how to kill", "how to murder", "i wanna attack", "i wanna have sex","make a bomb", " how to abuse"
-    ]
+print("🎤 Speak anytime. AI will listen.")
 
-    sensitive_words = [
-        "abuse", "violence", "suicide", "sex"
-    ]
+# -------------------------------
+# STOP AI IMMEDIATELY
+# -------------------------------
+def stop_ai():
+    global ai_speaking
+    with state_lock:
+        if ai_speaking:
+            speech_synthesizer.stop_speaking_async()
+            ai_speaking = False
+            print("🛑 AI stopped")
 
-    allowed_context = [
-        "help", "i need help", "support", "report", "someone tried", "i am scared", "explain", "what is ", "meaning of", "define"
-    ]
-    
-    for bw in blocked_words:
-        if bw in text:
-            return False
+# -------------------------------
+# SPEAK AI RESPONSE (NON-BLOCKING)
+# -------------------------------
+def speak_ai(text):
+    global ai_speaking
 
-    for sw in sensitive_words:
-        if sw in text:
-            for ctx in allowed_context:
-                if ctx in text:
-                    return True
-    return True
+    stop_ai()  # safety
 
-result = speech_recognizer.recognize_once()
+    def _speak():
+        global ai_speaking
+        with state_lock:
+            ai_speaking = True
 
-print("Done listening")
-print("Reason:", result.reason)
+        speech_synthesizer.speak_text_async(text)
 
-if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-    user_text = result.text
-    print("You said:", user_text)
+        # Allow speech time (state will be cleared by interruption or next input)
 
-    if not is_safe_input(user_text):
-        warning_text = "Sorry, I cannot rspond to that request."
-        print("Blocked by content moderation.")
-        speech_synthesizer.speak_text_async(warning_text).get()
-        exit()
+    threading.Thread(target=_speak, daemon=True).start()
 
-    response = openai.Completion.create(
-    engine="gpt-3.5-turbo-instruct",
-    prompt=user_text,
-    max_tokens=500,
-    temperature=0.7
-)
+# -------------------------------
+# USER SPEECH CALLBACK (INPUT GATED)
+# -------------------------------
+def on_user_speech(evt):
+    global ai_speaking
 
-    ai_reply = response.choices[0].text.strip()
-    print("AI:", ai_reply)
+    if evt.result.reason != speechsdk.ResultReason.RecognizedSpeech:
+        return
 
-    speech_synthesizer.speak_text_async(ai_reply).get()
+    user_text = evt.result.text.strip()
+    if not user_text:
+        return
 
-elif result.reason == speechsdk.ResultReason.Canceled:
-    print("Speech canceled")
-    cancellation_details = result.cancellation_details
-    print("Cancellation reason:", cancellation_details.reason)
+    print(f"User: {user_text}")
 
-    if cancellation_details.error_details:
-        print("Error details:", cancellation_details.error_details)
+    lower_text = user_text.lower()
 
-else:
-    print("Speech not recognized")
+    # -------------------------------
+    # CASE 1: AI IS SPEAKING
+    # -------------------------------
+    with state_lock:
+        speaking = ai_speaking
+
+    if speaking:
+    # Allow STOP-like commands even with punctuation
+        if any(cmd in lower_text for cmd in ["stop", "pause", "shut up"]):
+            stop_ai()
+        else:
+            print("⛔ Ignored (AI speaking)")
+        return
+
+
+    # -------------------------------
+    # CASE 2: AI IS SILENT → NORMAL INPUT
+    # -------------------------------
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a calm, helpful voice assistant."},
+                {"role": "user", "content": user_text}
+            ],
+            max_tokens=200,
+            temperature=0.5
+        )
+
+        ai_reply = response.choices[0].message.content.strip()
+        print(f"AI: {ai_reply}")
+
+        speak_ai(ai_reply)
+
+    except Exception as e:
+        print("❌ OpenAI error:", e)
+
+# -------------------------------
+# START CONTINUOUS LISTENING
+# -------------------------------
+speech_recognizer.recognized.connect(on_user_speech)
+speech_recognizer.start_continuous_recognition()
+
+# -------------------------------
+# KEEP PROGRAM ALIVE
+# -------------------------------
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    print("👋 Exiting...")
+    speech_recognizer.stop_continuous_recognition()
